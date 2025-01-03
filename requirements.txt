@@ -1,3 +1,9 @@
+uvicorn
+fastapi
+twilio
 flask
 requests
 openai
+botocore
+websockets
+numpy
