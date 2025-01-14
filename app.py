@@ -11,8 +11,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from s3_client import s3_client  # Import the S3 client object
+from asyncio import Queue
 
 # ssh -i ec2key.pem ec2-user@54.234.196.83 -vvv
+
+upload_queue = None
 
 # Configuration
 OPENAI_API_KEY = config.OPENAI_API_KEY
@@ -34,12 +37,17 @@ app = FastAPI()
 S3_BUCKET_NAME = "audio-calls-info"
 
 
+
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
+
+@app.get("/incorrect", response_class=JSONResponse)
+async def index_page():
+    return {"message": "Twilio connection failed"}
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
@@ -52,6 +60,7 @@ async def handle_incoming_call(request: Request):
     connect = Connect()
     connect.stream(url=f'wss://{host}/media-stream')
     response.append(connect)
+    print(str(response))
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 @app.websocket("/media-stream")
@@ -113,6 +122,9 @@ async def handle_media_stream(websocket: WebSocket):
         part_number = 1  # Start with part number 1
         parts = []  # Metadata for uploaded parts
         combined_audio_buffer = bytearray()
+
+
+
         
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
@@ -152,7 +164,7 @@ async def handle_media_stream(websocket: WebSocket):
                             "audio": data['media']['payload']
                         }
 
-                        print("SENT ONE MSG TO OPENAI")
+                        # print("SENT ONE MSG TO OPENAI")
                         await openai_ws.send(json.dumps(audio_append))
 
                         # Trigger upload if buffer size exceeds 5 MB
@@ -220,43 +232,24 @@ async def handle_media_stream(websocket: WebSocket):
 
 
                         # Trigger upload if buffer size exceeds 5 MB
-                        # await upload_audio_to_s3()
+                         # Enqueue upload task if buffer size exceeds threshold
+                        if len(combined_audio_buffer) >= 5 * 1024 * 1024:
+                            chunk = combined_audio_buffer[:5 * 1024 * 1024]
+                            combined_audio_buffer = combined_audio_buffer[5 * 1024 * 1024:]
+                            task_payload = {
+                                "chunk": chunk,
+                                "stream_sid": stream_sid,
+                                "upload_id": upload_id,
+                                "part_number": part_number
+                            }
 
-                   
+                        # Enqueue the task
+                        await upload_queue.put(task_payload)
+                        part_number += 1
+                                    
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
 
-        async def upload_audio_to_s3():
-            """Upload a single chunk of audio data to S3 if the buffer size exceeds the threshold."""
-            nonlocal combined_audio_buffer, part_number, parts, upload_id
-            try:
-                if len(combined_audio_buffer) >= 5 * 1024 * 1024:  # Check if the buffer has enough data
-                    # Extract a chunk of 5 MB
-                    chunk = combined_audio_buffer[:5 * 1024 * 1024]
-                    combined_audio_buffer = combined_audio_buffer[5 * 1024 * 1024:]  # Trim the buffer
-
-                    # Upload the chunk to S3
-                    response = s3_client.upload_part(
-                        Bucket=S3_BUCKET_NAME,
-                        Key=f"{stream_sid}_combined_audio.raw",
-                        PartNumber=part_number,
-                        UploadId=upload_id,
-                        Body=chunk,
-                    )
-                    # Record the part metadata
-                    parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-                    print(f"Uploaded part {part_number} to S3.")
-                    part_number += 1
-                        #part_number += 1
-
-                    await asyncio.sleep(1)  # Check periodically for new data
-
-                    part_number += 1
-
-                    await asyncio.sleep(1)  # Check periodically for new data
-
-            except Exception as e:
-                print(f"Error in upload_audio_to_s3: {e}")
 
         async def complete_s3_upload():
             """Complete the multipart upload to S3."""
@@ -358,7 +351,40 @@ async def handle_media_stream(websocket: WebSocket):
             print ("came into finally before complete_s3_upload")
             await complete_s3_upload()
 
+async def process_upload_queue():
+            """Background task to handle audio uploads to S3."""
+            part_number = 1
+            parts = []
+            while True:
+                task_payload = await upload_queue.get()  # Wait for a chunk to upload
+                try:
+                    chunk = task_payload["chunk"]
+                    stream_sid = task_payload["stream_sid"]
+                    upload_id = task_payload["upload_id"]
+                    part_number = task_payload["part_number"]
+                    # Upload the chunk to S3
+                    response = s3_client.upload_part(
+                        Bucket=S3_BUCKET_NAME,
+                        Key=f"{stream_sid}_combined_audio.raw",
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=chunk,
+                    )
+                    parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+                    print(f"Uploaded part {part_number} to S3.")
+                    part_number += 1
+                except Exception as e:
+                    print(f"Error uploading audio chunk: {e}")
+                finally:
+                    upload_queue.task_done()  # Mark task as done
 
+@app.on_event("startup")
+async def start_background_tasks():
+    """Start the background task for processing the upload queue."""
+    global upload_queue
+    upload_queue = Queue()
+    loop = asyncio.get_event_loop()  # Get the current event loop
+    loop.create_task(process_upload_queue())  # Schedule the background task
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
